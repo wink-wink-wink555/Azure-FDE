@@ -18,6 +18,7 @@ import json
 import os
 import time
 from html import escape as _html_escape
+from typing import Any
 
 import streamlit as st
 from dotenv import load_dotenv
@@ -299,6 +300,53 @@ def _tool_cards_html(result: StepResult) -> str:
     return "".join(cards)
 
 
+def _revision_card_html(revision: dict[str, Any]) -> str:
+    def escaped(value: Any, missing: str = "Not recorded.") -> str:
+        if value is None:
+            return missing
+        text = str(value).replace("\r\n", "\n").replace("\r", "\n")
+        return _html_escape(text).replace("\n", "<br/>")
+
+    def snapshot_html(label: str, snapshot: Any) -> str:
+        if snapshot is None:
+            body = "<div>Snapshot not recorded.</div>"
+        elif not isinstance(snapshot, list):
+            body = f"<div>{escaped(snapshot)}</div>"
+        elif not snapshot:
+            body = "<div>No remaining steps in this snapshot.</div>"
+        else:
+            items = []
+            for item in snapshot:
+                if not isinstance(item, dict):
+                    items.append(f"<li>{escaped(item)}</li>")
+                    continue
+                number = escaped(item.get("n"), "not recorded")
+                goal = escaped(item.get("goal"), "not recorded")
+                hint = escaped(item.get("tool_hint"), "not recorded")
+                items.append(f"<li>Step {number} [{hint}]: {goal}</li>")
+            body = f"<ul>{''.join(items)}</ul>"
+        return f"<div><strong>{label}:</strong></div>{body}"
+
+    before = revision.get("before")
+    after = revision.get("after")
+    unchanged = (
+        "before" in revision
+        and "after" in revision
+        and before is not None
+        and before == after
+    )
+    unchanged_html = "<div>Remaining plan unchanged.</div>" if unchanged else ""
+    return (
+        "<div class='revision-card'>"
+        f"<strong>Plan revision after Step {escaped(revision.get('after_step'))}</strong>"
+        f"<div><strong>Trigger:</strong> {escaped(revision.get('trigger'))}</div>"
+        f"{snapshot_html('Before', before)}"
+        f"{snapshot_html('After', after)}"
+        f"{unchanged_html}"
+        "</div>"
+    )
+
+
 def _render_run(goal: str, run: PlanRun) -> None:
     # User goal pill
     st.markdown(
@@ -316,29 +364,46 @@ def _render_run(goal: str, run: PlanRun) -> None:
     if run.initial_plan:
         st.markdown(_plan_html(run.initial_plan), unsafe_allow_html=True)
 
-    # ===================================================================
-    # TODO A3 -- render the step trace and any mid-run replans
-    # ===================================================================
-    #
-    # A reviewer looking at this page must be able to answer, without opening
-    # a terminal: what did the agent do, in what order, what did each step
-    # conclude, which tools ran with which arguments, and -- if the plan
-    # changed mid-run -- when it changed and what triggered it.
-    #
-    # `run.step_results` holds one StepResult per executed step.
-    # `run.revisions` holds one dict per replan, with keys "after_step",
-    # "trigger", "before" and "after".
-    #
-    # _step_card_html() and _tool_cards_html() are written for you just above
-    # and return HTML strings. Render HTML with
-    # st.markdown(..., unsafe_allow_html=True), and put per-step detail behind
-    # st.expander(...) so the page stays scannable.
-    #
-    # Escape anything that came from the model or the web before it reaches
-    # the page. Delete the caption below when you are done.
-    st.caption("TODO A3: render the step trace and revision panel here.")
-    # END TODO A3
-    # ===================================================================
+    st.text(f"Run status: {run.stopped_reason}")
+    if not run.step_results:
+        st.text("No recorded step results.")
+
+    revisions_by_result: dict[int, list[dict[str, Any]]] = {}
+    unplaced_revisions: list[dict[str, Any]] = []
+    for revision in run.revisions:
+        matching_results = [
+            index
+            for index, result in enumerate(run.step_results)
+            if result.step.n == revision.get("after_step")
+        ]
+        if len(matching_results) == 1:
+            revisions_by_result.setdefault(matching_results[0], []).append(revision)
+        else:
+            unplaced_revisions.append(revision)
+
+    for index, result in enumerate(run.step_results):
+        st.markdown(_step_card_html(result), unsafe_allow_html=True)
+        with st.expander(f"Step {result.step.n} details"):
+            st.markdown("**Execution result**")
+            st.text(result.text or "No execution text recorded.")
+            st.markdown("**Tool calls**")
+            tool_cards = _tool_cards_html(result)
+            if tool_cards:
+                st.markdown(tool_cards, unsafe_allow_html=True)
+            else:
+                st.text("No tool calls recorded.")
+
+        for revision in revisions_by_result.get(index, []):
+            st.markdown(_revision_card_html(revision), unsafe_allow_html=True)
+
+    if unplaced_revisions:
+        st.caption("Unplaced plan revisions")
+        st.text(
+            "The following audit records could not be uniquely associated "
+            "with a recorded step."
+        )
+        for revision in unplaced_revisions:
+            st.markdown(_revision_card_html(revision), unsafe_allow_html=True)
 
     # Cover image
     if run.image_url:
@@ -394,12 +459,17 @@ if st.session_state["pending_plan"] is not None:
         goal = pending["goal"]
         with st.status("Running approved plan...", expanded=False) as status:
             t0 = time.time()
+
+            def render_completed_step(result: StepResult) -> None:
+                st.markdown(_step_card_html(result), unsafe_allow_html=True)
+
             # Run the plan the user actually approved -- not a fresh draft.
             # The gate auto-approves because the approval already happened here.
             run = run_planning_agent(
                 goal,
                 plan=pending["plan"],
                 approve_plan=lambda p: True,
+                on_step_done=render_completed_step,
                 max_steps=max_steps,
                 max_revisions=max_revisions,
                 per_step_tool_calls=per_step_calls,

@@ -184,7 +184,53 @@ def revise_plan(
     renumbering case; `write_plan` above does not need it, so it does not show
     it. Read `write_plan` first -- it is the same shape of problem.
     """
-    raise NotImplementedError("TODO A1: implement revise_plan")
+    if not remaining:
+        return []
+
+    capacity = max_steps - len(done)
+    if capacity <= 0:
+        return []
+    start_at = done[-1][0].n + 1 if done else 1
+
+    done_text = "\n".join(
+        f"step {step.n} [{step.tool_hint}]: {step.goal}\n  observation: {observed}"
+        for step, observed in done
+    ) or "(none)"
+    remaining_text = "\n".join(
+        f"step {step.n} [{step.tool_hint}]: {step.goal}"
+        for step in remaining
+    )
+    user_msg = (
+        f"Original goal:\n{goal}\n\n"
+        f"Already done:\n{done_text}\n\n"
+        f"Remaining steps:\n{remaining_text}\n\n"
+        f"Triggering observation:\n{observation}\n\n"
+        f"Total step limit: {max_steps}. Remaining capacity: {capacity}.\n"
+        "Revise the remaining plan now."
+    )
+
+    try:
+        raw = chat(
+            [
+                {"role": "system", "content": REVISER_SYSTEM},
+                {"role": "user", "content": user_msg},
+            ],
+            temperature=0.3,
+            max_tokens=500,
+        )
+        steps = _parse_plan(raw, max_steps=capacity, expect_start_at=start_at)
+    except Exception:
+        steps = []
+
+    if not steps or steps[-1].tool_hint != "none":
+        # An unusable revision must not discard the approved future work.
+        return list(remaining)
+
+    # The parser preserves explicit model numbers; normalise fresh steps here.
+    return [
+        Step(n=start_at + i, goal=step.goal, tool_hint=step.tool_hint)
+        for i, step in enumerate(steps)
+    ]
 
 
 # ===========================================================================

@@ -279,7 +279,88 @@ def run_planning_agent(
         A PlanRun. This function does not raise for ordinary failures -- it
         reports them through stopped_reason and final_answer.
     """
-    raise NotImplementedError("TODO A2: implement the plan/act/observe/replan loop")
+    if not goal.strip():
+        return _stopped(
+            goal, [] if plan is None else plan, "error", "Please type a goal first."
+        )
+
+    if plan is None:
+        try:
+            plan = write_plan(goal, max_steps=max_steps)
+        except Exception:
+            plan = []
+    initial_plan = list(plan)
+    if not initial_plan:
+        return _stopped(
+            goal, initial_plan, "error", "I couldn't draft a plan. Please rephrase your goal."
+        )
+    if len(initial_plan) > max_steps:
+        return _stopped(
+            goal, initial_plan, "error",
+            "The plan exceeds the total step limit. Please shorten it or raise max_steps.",
+        )
+
+    if approve_plan is not None:
+        try:
+            approved = approve_plan(list(initial_plan))
+        except Exception:
+            return _stopped(
+                goal, initial_plan, "error", "Plan approval failed. No steps were executed."
+            )
+        if not approved:
+            return _stopped(
+                goal, initial_plan, "cancelled", "Cancelled before any tool ran."
+            )
+
+    recorder = _RunRecorder(goal, initial_plan, on_step_done)
+    queue = list(initial_plan)
+    done: list[tuple[Step, str]] = []
+    error_message = ""
+    while queue:
+        step = queue.pop(0)
+        prior_summary = "\n".join(
+            f"step {past.n} [{past.tool_hint}]: {observed}" for past, observed in done
+        )
+        try:
+            result = execute_step(
+                step, goal, prior_summary=prior_summary, max_tool_calls=per_step_tool_calls
+            )
+        except Exception:
+            error_message = f"Execution failed at step {step.n}. Remaining steps were not executed."
+            break
+
+        recorder.record_step(result)
+        observation = result.observation
+        done.append((step, observation))
+        if result.status == "error":
+            error_message = f"Step {step.n} reported an error. Remaining steps were not executed."
+            break
+
+        if (
+            observation.strip().lower().startswith("surprise")
+            and queue
+            and recorder.revision_count < max_revisions
+        ):
+            before = list(queue)
+            try:
+                revised = revise_plan(
+                    goal, done=list(done), remaining=list(queue),
+                    observation=observation, max_steps=max_steps,
+                )
+                queue = list(revised)
+            except Exception:
+                error_message = f"Replanning failed after step {step.n}. Remaining steps were not executed."
+                break
+            recorder.record_revision(
+                after_step=step.n, trigger=observation, before=before, after=queue
+            )
+
+    if error_message:
+        run = recorder.finish("error")
+        # A previous narrative answer must not hide a later failure.
+        run.final_answer = error_message
+        return run
+    return recorder.finish("done")
 
 
 # ===========================================================================
@@ -378,6 +459,13 @@ def _execute_tool_step(
                 image_url=image_url,
                 sources=sources,
             )
+
+        # A single model response can contain several requests.  Limit the
+        # batch before recording it in the transcript: otherwise every call
+        # in the batch would run even when only one tool call remains in the
+        # per-step budget.
+        remaining_calls = max_tool_calls - tool_calls_used
+        tcs = tcs[:remaining_calls]
 
         messages.append(
             {
